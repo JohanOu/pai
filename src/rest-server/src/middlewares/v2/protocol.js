@@ -24,6 +24,7 @@ const hived = require('@pai/middlewares/v2/hived');
 const { enabledHived } = require('@pai/config/launcher');
 const protocolSchema = require('@pai/config/v2/protocol');
 const asyncHandler = require('@pai/middlewares/v2/asyncHandler');
+const request = require('request');
 
 const mustacheWriter = new mustache.Writer();
 
@@ -150,6 +151,14 @@ const protocolValidate = (protocolYAML) => {
       );
     }
   }
+  //如果jobPriorityClass被设置成fail，说明用户提交的任务已超出规则限制，报错提醒用户
+  if (protocolObj.extras.hivedScheduler.jobPriorityClass == "fail") {
+    throw createError(
+      'Bad Request',
+      'ResourceExceedError',
+      `The resource you request exceeds the limit in the rules!\nPlease reduce the SKU count or waiting for previous job completion.`,
+    );
+  }
   return protocolObj;
 };
 
@@ -190,11 +199,11 @@ const protocolRender = (protocolObj) => {
       $parameters: protocolObj.parameters,
       $script:
         protocolObj.prerequisites.script[
-          protocolObj.taskRoles[taskRole].script
+        protocolObj.taskRoles[taskRole].script
         ],
       $output:
         protocolObj.prerequisites.output[
-          protocolObj.taskRoles[taskRole].output
+        protocolObj.taskRoles[taskRole].output
         ],
       $data:
         protocolObj.prerequisites.data[protocolObj.taskRoles[taskRole].data],
@@ -204,8 +213,230 @@ const protocolRender = (protocolObj) => {
   return protocolObj;
 };
 
+
+//从数据库中读取rules
+const mysql = require('mysql')
+const pool = mysql.createPool({
+  host: 'localhost',
+  user: 'root',
+  password: 'NLPlogmein608',
+  database: 'openpai'
+})
+
+function getData(sql, values) {
+  return new Promise((resolve, reject) => {
+    pool.getConnection(function (err, connection) {
+      if (err) {
+        reject(err)
+      } else {
+        connection.query(sql, values, (err, rows) => {
+          if (err) {
+            reject(err)
+          } else {
+            resolve(rows);
+          }
+          connection.release()
+        })
+      }
+    })
+  })
+}
+
+//全局application token
+global.app_token = "";
+//是否第一次运行标识
+global.firstTimeFlag = true;
+
+//获取已占用或已申请占用的gpu数
+function get_occupied_gpu(username) {
+  return new Promise(async function (resolve, reject) {
+
+    //第一次运行，从数据库获取application token
+    if (global.firstTimeFlag) {
+      try {
+        tokenData = await getData("select * from token");
+      } catch (error) {
+        reject(error);
+      }
+      global.app_token = tokenData[0]["app_token"];
+      global.firstTimeFlag = false;
+    }
+
+    var occupied_gpu_num = 0;
+    request.get(
+      {
+        url: 'http://localhost:9186/api/v2/jobs?username=' + username + '&state=WAITING,RUNNING',
+        method: "get",
+        json: true,
+        headers: {
+          "content-type": "application/json",
+          "Authorization": "Bearer " + global.app_token
+        }
+      },
+      function (error, response, body) {
+        // console.error('error:', error);
+        // console.log('statusCode:', response && response.statusCode);
+        for (let i in body) {
+          occupied_gpu_num += body[i]["totalGpuNumber"];
+        }
+        resolve(occupied_gpu_num);
+      }
+    );
+
+  });
+}
+
+// 获取已占用或已申请占用的高优先级gpu数
+function get_occupied_high_priority_gpu(username) {
+  return new Promise(function (resolve, reject) {
+    const request = require('request');
+    var occupied_high_priority_gpu = 0;
+    request.get(
+      {
+        url: 'http://localhost:9186/api/v2/jobs?username=' + username + '&state=WAITING,RUNNING&jobPriority=prod',
+        method: "get",
+        json: true,
+        headers: {
+          "content-type": "application/json",
+          "Authorization": "Bearer " + global.app_token
+        }
+      },
+      function (error, response, body) {
+        // console.error('error:', error); 
+        // console.log('statusCode:', response && response.statusCode);
+
+        //累加各任务gpu数
+        for (let i in body) {
+          occupied_high_priority_gpu += body[i]["totalGpuNumber"];
+        }
+        resolve(occupied_high_priority_gpu);
+      }
+    );
+
+  });
+}
+
 const protocolSubmitMiddleware = [
-  (req, res, next) => {
+  async (req, res, next) => {
+    if(req.body.indexOf("hivedScheduler:")==-1){
+      let pos = req.body.lastIndexOf("extras:") + 7;
+      let newBody = req.body.slice(0, pos) + '\n  hivedScheduler:\n    jobPriorityClass: test' + req.body.slice(pos);
+      req.body = newBody;
+    }
+    //req:string转protocol
+    var req_protocol = protocolValidate(req.body);
+
+    //计算用户本次提交到任务所需的gpu数
+    var req_gpu = 0;
+    for (let i in req_protocol.taskRoles) {
+      var instances = req_protocol.taskRoles[i]["instances"];
+      var gpuPerInstance = req_protocol.taskRoles[i]["resourcePerInstance"]["gpu"];
+      req_gpu += instances * gpuPerInstance;
+    }
+
+    var occupied_gpu = 0;
+    //获取用户已占用的gpu数
+    try {
+      occupied_gpu = await get_occupied_gpu(req.user.username);
+    } catch (error) {
+      console.log("数据库连接错误！！！")
+      console.log(error)
+    }
+
+    var occupy_high_priority_gpu = await get_occupied_high_priority_gpu(req.user.username);
+
+    //用户已占用gpu和本次提交申请的gpu数之和
+    var total_gpu = occupied_gpu + req_gpu;
+    var total_high_priority_gpu = occupy_high_priority_gpu + req_gpu;
+
+    //当前提交的任务的用户名、vc、优先级信息
+    var req_username = req.user.username;
+    var req_vc = req_protocol.defaults.virtualCluster;
+    var req_priority = req_protocol.extras.hivedScheduler.jobPriorityClass;
+    if (!req_priority)
+      req_priority = "default";
+
+    //数据库读出规则并验证，更改优先级
+    var sql = "select * from rules order by rule_id desc";
+    try {
+      var rules = await getData(sql);
+    } catch (error) {
+      console.log("数据库连接错误！！！");
+      console.log(error);
+    }
+
+    var keyword = req_priority;//keyword初始化为请求任务的优先级
+    for (let i in rules) {
+      let rule_id = rules[i]["rule_id"];
+      let username_match = rules[i]["username_match"];
+      let VC = rules[i]["VC"];
+      let current_priority = rules[i]["current_priority"];
+      let common_occupied_gpu_limit = rules[i]["common_occupied_gpu_limit"];
+      let high_priority_occupied_gpu_limit = rules[i]["high_priority_occupied_gpu_limit"];
+      let changed_priority = rules[i]["changed_priority"];
+      if (req_username.match(username_match)) {//用户名匹配
+        console.log(username_match,VC)
+        if (!VC || (VC.indexOf(req_vc)!=-1)) {//VC为空或VC匹配
+          console.log(VC);
+          console.log(req_vc);
+          if (!current_priority || (current_priority.indexOf(keyword) != -1)) {//优先级为空或匹配
+
+            if (common_occupied_gpu_limit != null && total_gpu > common_occupied_gpu_limit) {//普通gpu限制不为空，且当前总申请gpu超过了普通gpu限制 
+              if (changed_priority == "retain")//若即将改变的优先级为retain，rule匹配成功，不再继续匹配
+                break;
+              keyword = changed_priority;//改变优先级
+              if (keyword == "fail")//若即将改变的优先级为fail，rule匹配成功，不再继续匹配
+                break;
+            }
+            else if (high_priority_occupied_gpu_limit != null && total_high_priority_gpu > high_priority_occupied_gpu_limit)//高优先级gpu限制不为空，且当前总申请高优先级gpu超过了限制
+            {
+              if (changed_priority == "retain")//若即将改变的优先级为retain，rule匹配成功，不再继续匹配
+                break;
+              keyword = changed_priority;//改变优先级
+              if (keyword == "fail")//若即将改变的优先级为fail，rule匹配成功，不再继续匹配
+                break;
+            }
+            else if (common_occupied_gpu_limit == null && high_priority_occupied_gpu_limit == null) {//限制都为空则匹配规则
+              if (changed_priority == "retain")//若即将改变的优先级为retain，rule匹配成功，不再继续匹配
+                break;
+              keyword = changed_priority;//改变优先级
+              if (keyword == "fail")//若即将改变的优先级为fail，rule匹配成功，不再继续匹配
+                break;
+            }
+            else {
+              continue;
+            }
+          }
+          else
+            continue;
+        }
+        else {
+          continue;
+        }
+      }
+      else {
+        continue;
+      }
+    }
+
+    //根据规则所得keyword重新设置优先级
+    var body_str = req.body;
+    var priority_str = "test";
+    if (keyword == "default")
+      keyword = "test";
+    priority_str = keyword;
+
+    var current_priority = req_protocol.extras.hivedScheduler.jobPriorityClass;
+    if (!current_priority) {
+      let pos = body_str.lastIndexOf("hivedScheduler:") + 15;
+      let new_body = body_str.slice(0, pos) + '\n    jobPriorityClass: ' + priority_str + body_str.slice(pos);
+      req.body = new_body;
+    }
+    else {
+      req.body = body_str.replace(/(?<=jobPriorityClass: ).+(?=\n)/, priority_str);
+    }
+
+
     res.locals.protocol = req.body;
     next();
   },
@@ -223,6 +454,7 @@ const protocolSubmitMiddleware = [
         res.locals.protocol,
         req.user.username,
       );
+
     }
     next();
   }),
